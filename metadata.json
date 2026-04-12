@@ -1,0 +1,5 @@
+{
+  "name": "Safety is the Key Ltd Audit",
+  "description": "Professional mobile-first health and safety inspection tool for office environments.",
+  "requestFramePermissions": ["camera"]
+}

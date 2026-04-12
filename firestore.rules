@@ -1,0 +1,85 @@
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: audits
+// Document ID: auto-generated or custom ID
+// Fields:
+//   - id: string (required) - Unique audit ID
+//   - clientName: string (required) - Name of the client
+//   - siteName: string (required) - Name of the site
+//   - siteAddress: string (required) - Full address of the site
+//   - auditDate: string (required) - ISO date string of the audit
+//   - auditorName: string (required) - Name of the auditor
+//   - status: string (required) - 'draft' or 'completed'
+//   - sections: list (required) - Array of audit sections
+//   - generalComments: string (optional) - Final summary comments
+//   - createdAt: string (required) - ISO creation timestamp
+//   - updatedAt: string (required) - ISO last update timestamp
+//
+// ===============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/adminUsers/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/adminUsers/$(request.auth.uid)).data.active == true;
+    }
+
+    // Domain Validators
+    function isValidAudit(data) {
+      return data.keys().hasAll(['id', 'clientName', 'siteName', 'siteAddress', 'auditDate', 'auditorName', 'status', 'sections', 'createdAt', 'updatedAt']) &&
+             data.clientName is string && data.clientName.size() > 0 && data.clientName.size() < 200 &&
+             data.siteName is string && data.siteName.size() > 0 && data.siteName.size() < 200 &&
+             data.status in ['draft', 'completed'] &&
+             data.sections is list && data.sections.size() <= 20;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /audits/{auditId} {
+      // For this prototype, we allow authenticated users to read and write audits
+      // In a production app, we would scope this to specific users or organizations
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidAudit(request.resource.data);
+      allow update: if isAuthenticated() && isValidAudit(request.resource.data);
+      allow delete: if isAuthenticated();
+    }
+
+    match /auditTemplates/{templateId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /auditTemplateVersions/{versionId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /adminUsers/{uid} {
+      allow read: if isAuthenticated() && (request.auth.uid == uid || isAdmin());
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /test/connection {
+      allow read: if true;
+    }
+  }
+}
