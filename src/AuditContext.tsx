@@ -128,6 +128,8 @@ export function AuditProvider({ children }: { children: ReactNode }) {
         observation: undefined,
         photoUrl: undefined,
         photoPath: undefined,
+        photoDataUrl: undefined,
+        photos: [],
       })),
     }));
 

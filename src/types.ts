@@ -6,6 +6,14 @@ export type FindingStatus = 'Open' | 'Closed' | 'In Progress';
 
 export type RiskBand = 'Low' | 'Moderate' | 'High' | 'Very High';
 
+export interface ItemPhoto {
+  id: string;
+  url?: string;
+  path?: string;
+  dataUrl?: string;
+  pending?: boolean;
+}
+
 export interface ChecklistItem {
   id: string;
   question: string;
@@ -27,9 +35,13 @@ export interface ChecklistItem {
   positiveStatement?: string;
   negativeFinding?: string;
   observation?: string;
+  /** @deprecated use photos[] instead */
   photoUrl?: string;
+  /** @deprecated use photos[] instead */
   photoPath?: string;
+  /** @deprecated use photos[] instead */
   photoDataUrl?: string;
+  photos?: ItemPhoto[];
 }
 
 export interface AuditSection {

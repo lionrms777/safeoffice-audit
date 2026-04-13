@@ -13,6 +13,11 @@ export interface UploadedPhotoMeta {
   storagePath: string;
 }
 
+interface UploadPhotoOptions {
+  maxAttempts?: number;
+  stallTimeoutMs?: number;
+}
+
 const MAX_UPLOAD_ATTEMPTS = 2;
 const STALL_TIMEOUT_MS = 45000;
 
@@ -47,6 +52,7 @@ const uploadAuditPhotoOnce = async (
   auditId: string,
   file: File,
   onProgress?: (progress: number) => void,
+  options?: UploadPhotoOptions,
 ): Promise<UploadedPhotoMeta> => {
   const safeName = sanitizeFileName(file.name || 'photo.jpg');
   const storagePath = `audits/${auditId}/${Date.now()}_${safeName}`;
@@ -59,13 +65,14 @@ const uploadAuditPhotoOnce = async (
 
     let stalled = false;
     let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    const stallTimeoutMs = options?.stallTimeoutMs ?? STALL_TIMEOUT_MS;
 
     const resetStallTimer = () => {
       if (stallTimer) clearTimeout(stallTimer);
       stallTimer = setTimeout(() => {
         stalled = true;
         task.cancel();
-      }, STALL_TIMEOUT_MS);
+      }, stallTimeoutMs);
     };
 
     resetStallTimer();
@@ -102,18 +109,20 @@ export const uploadAuditPhotoWithMeta = async (
   auditId: string,
   file: File,
   onProgress?: (progress: number) => void,
+  options?: UploadPhotoOptions,
 ): Promise<UploadedPhotoMeta> => {
   let lastError: unknown = null;
+  const maxAttempts = options?.maxAttempts ?? MAX_UPLOAD_ATTEMPTS;
 
-  for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const uploaded = await uploadAuditPhotoOnce(auditId, file, onProgress);
+      const uploaded = await uploadAuditPhotoOnce(auditId, file, onProgress, options);
       console.log('✅ Photo uploaded to Storage:', uploaded.downloadURL);
       return uploaded;
     } catch (error) {
       lastError = error;
       console.warn(`⚠️ Upload attempt ${attempt} failed:`, error);
-      if (attempt < MAX_UPLOAD_ATTEMPTS) {
+      if (attempt < maxAttempts) {
         await sleep(700 * attempt);
       }
     }
@@ -207,8 +216,14 @@ export const getChecklistPhotoUrls = (audit: Audit): string[] => {
   const urls = new Set<string>();
   audit.sections.forEach((section) => {
     section.items.forEach((item) => {
+      // Legacy single-photo fields
       if (item.photoUrl?.trim()) urls.add(item.photoUrl.trim());
       if (item.photoPath?.trim()) urls.add(item.photoPath.trim());
+      // New multi-photo array
+      item.photos?.forEach((photo) => {
+        if (photo.url?.trim()) urls.add(photo.url.trim());
+        if (photo.path?.trim()) urls.add(photo.path.trim());
+      });
     });
   });
   return [...urls];

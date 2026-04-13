@@ -3,6 +3,7 @@ export interface PendingPhotoUpload {
   auditId: string;
   sectionId: string;
   itemId: string;
+  photoId: string;
   fileName: string;
   fileType: string;
   dataUrl: string;
@@ -34,7 +35,13 @@ export const getPendingUploadsForAudit = (auditId: string): PendingPhotoUpload[]
 
 export const addPendingUpload = (upload: PendingPhotoUpload): PendingPhotoUpload[] => {
   const queue = readQueue();
-  const next = [...queue, upload];
+  const next = [
+    ...queue.filter(
+      (item) =>
+        !(item.auditId === upload.auditId && item.itemId === upload.itemId && item.photoId === upload.photoId),
+    ),
+    upload,
+  ];
   writeQueue(next);
   return next;
 };
@@ -47,6 +54,14 @@ export const removePendingUpload = (id: string): PendingPhotoUpload[] => {
 
 export const removePendingUploadsForItem = (auditId: string, itemId: string): PendingPhotoUpload[] => {
   const next = readQueue().filter((item) => !(item.auditId === auditId && item.itemId === itemId));
+  writeQueue(next);
+  return next;
+};
+
+export const removePendingUploadForPhoto = (auditId: string, photoId: string): PendingPhotoUpload[] => {
+  const next = readQueue().filter(
+    (item) => !(item.auditId === auditId && item.photoId === photoId),
+  );
   writeQueue(next);
   return next;
 };

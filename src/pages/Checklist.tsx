@@ -2,8 +2,8 @@ import { useState, useEffect, useRef, ChangeEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import Layout from '../components/Layout';
 import { useAudits } from '../AuditContext';
-import { Audit, ComplianceStatus, Finding, Action, ChecklistItem } from '../types';
-import { X, Camera, MessageSquare, ChevronDown, ChevronUp, Save, Loader2, AlertTriangle, ChevronRight, Download, ExternalLink, WifiOff, RefreshCw } from 'lucide-react';
+import { Audit, ComplianceStatus, Finding, Action, ChecklistItem, ItemPhoto } from '../types';
+import { X, MessageSquare, ChevronDown, ChevronUp, Save, Loader2, AlertTriangle, ChevronRight, ChevronLeft, Download, WifiOff, RefreshCw, ImagePlus, ZoomIn } from 'lucide-react';
 import { cn, compressImageUnderSize, withTimeout } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { uploadAuditPhotoWithMeta } from '../lib/firebaseStorage';
@@ -15,6 +15,7 @@ import {
   PendingPhotoUpload,
   removePendingUpload,
   removePendingUploadsForItem,
+  removePendingUploadForPhoto,
   updatePendingUploadError,
 } from '../lib/photoUploadQueue';
 import {
@@ -35,34 +36,66 @@ const createId = (prefix: string) => {
 export default function Checklist() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const { getAudit, saveAudit } = useAudits();
+  const { getAudit, saveAudit, loading } = useAudits();
   const [audit, setAudit] = useState<Audit | null>(null);
   const [activeSection, setActiveSection] = useState<string | null>(null);
-  const [uploadingItem, setUploadingItem] = useState<string | null>(null);
+  const [uploadingPhotoId, setUploadingPhotoId] = useState<string | null>(null);
   const [uploadStage, setUploadStage] = useState<'idle' | 'compressing' | 'uploading'>('idle');
   const [uploadProgress, setUploadProgress] = useState(0);
   const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const [isSyncingQueue, setIsSyncingQueue] = useState(false);
   const [pendingUploads, setPendingUploads] = useState<PendingPhotoUpload[]>([]);
   const [uploadErrors, setUploadErrors] = useState<Record<string, string>>({});
+  // localPreviews is keyed by photoId (not itemId) so multiple photos per item each have their own slot
   const [localPreviews, setLocalPreviews] = useState<Record<string, string>>({});
+  const [lightboxState, setLightboxState] = useState<{ itemId: string; photos: ItemPhoto[]; photoIndex: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const syncPendingUploadsRef = useRef<(() => void) | null>(null);
-  const [currentUploadTarget, setCurrentUploadTarget] = useState<{ sectionId: string, itemId: string } | null>(null);
+  const objectPreviewUrlsRef = useRef<Record<string, string>>({});
+  const [currentUploadTarget, setCurrentUploadTarget] = useState<{ sectionId: string; itemId: string; photoId: string } | null>(null);
+
+  const clearObjectPreview = (photoId: string) => {
+    const previewUrl = objectPreviewUrlsRef.current[photoId];
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+      delete objectPreviewUrlsRef.current[photoId];
+    }
+  };
+
+  const setObjectPreview = (photoId: string, file: File) => {
+    clearObjectPreview(photoId);
+    const previewUrl = URL.createObjectURL(file);
+    objectPreviewUrlsRef.current[photoId] = previewUrl;
+    setLocalPreviews((prev) => ({ ...prev, [photoId]: previewUrl }));
+  };
+
+  const setPersistentPreview = (photoId: string, dataUrl: string) => {
+    clearObjectPreview(photoId);
+    setLocalPreviews((prev) => ({ ...prev, [photoId]: dataUrl }));
+  };
 
   useEffect(() => {
-    if (id) {
-      const found = getAudit(id);
-      if (found) {
-        setAudit(found);
-        if (found.sections && found.sections.length > 0) {
-          setActiveSection(found.sections[0].id);
-        }
-      } else {
-        navigate('/');
-      }
+    if (!id || loading) return;
+
+    const found = getAudit(id);
+    if (!found) {
+      navigate('/');
+      return;
     }
-  }, [id, getAudit, navigate]);
+
+    setAudit(found);
+    setActiveSection((current) => {
+      if (!found.sections || found.sections.length === 0) {
+        return null;
+      }
+
+      if (current && found.sections.some((section) => section.id === current)) {
+        return current;
+      }
+
+      return found.sections[0].id;
+    });
+  }, [id, loading, getAudit, navigate]);
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
@@ -81,10 +114,17 @@ export default function Checklist() {
     setPendingUploads(queue);
     const previews: Record<string, string> = {};
     queue.forEach((entry) => {
-      previews[entry.itemId] = entry.dataUrl;
+      previews[entry.photoId] = entry.dataUrl;
+      clearObjectPreview(entry.photoId);
     });
     setLocalPreviews(previews);
   }, [audit?.id]);
+
+  useEffect(() => {
+    return () => {
+      Object.keys(objectPreviewUrlsRef.current).forEach((itemId) => clearObjectPreview(itemId));
+    };
+  }, []);
 
   // Auto-sync effect must be here (before early returns) to obey Rules of Hooks.
   useEffect(() => {
@@ -220,15 +260,18 @@ export default function Checklist() {
     sourceFile: File,
     sectionId: string,
     itemId: string,
+    photoId: string,
     message: string,
+    dataUrlOverride?: string,
   ) => {
     if (!audit) return;
-    const dataUrl = await fileToDataUrl(sourceFile);
+    const dataUrl = dataUrlOverride || await fileToDataUrl(sourceFile);
     const entry: PendingPhotoUpload = {
       id: createId('pending-photo'),
       auditId: audit.id,
       sectionId,
       itemId,
+      photoId,
       fileName: sourceFile.name || `${itemId}.jpg`,
       fileType: sourceFile.type || 'image/jpeg',
       dataUrl,
@@ -237,55 +280,78 @@ export default function Checklist() {
     };
     const nextQueue = addPendingUpload(entry);
     setPendingUploads(nextQueue.filter((p) => p.auditId === audit.id));
-    setLocalPreviews((prev) => ({ ...prev, [itemId]: dataUrl }));
-    setUploadErrors((prev) => ({ ...prev, [itemId]: message }));
+    setPersistentPreview(photoId, dataUrl);
+    setUploadErrors((prev) => ({ ...prev, [photoId]: message }));
   };
 
-  const clearPendingForItem = (itemId: string) => {
+  const clearPendingForPhoto = (photoId: string) => {
     if (!audit) return;
-    const nextQueue = removePendingUploadsForItem(audit.id, itemId);
+    const nextQueue = removePendingUploadForPhoto(audit.id, photoId);
     setPendingUploads(nextQueue.filter((p) => p.auditId === audit.id));
+    clearObjectPreview(photoId);
     setLocalPreviews((prev) => {
       const next = { ...prev };
-      delete next[itemId];
+      delete next[photoId];
       return next;
     });
     setUploadErrors((prev) => {
       const next = { ...prev };
-      delete next[itemId];
+      delete next[photoId];
       return next;
     });
   };
 
-  const syncPendingUploads = async (itemId?: string) => {
+  const syncPendingUploads = async (filterPhotoId?: string) => {
     if (!audit || !isOnline) return;
-    const queue = getPendingUploadsForAudit(audit.id).filter((entry) => !itemId || entry.itemId === itemId);
+    const queue = getPendingUploadsForAudit(audit.id).filter((entry) => !filterPhotoId || entry.photoId === filterPhotoId);
     if (queue.length === 0) return;
 
     setIsSyncingQueue(true);
     try {
       for (const entry of queue) {
         try {
-          setUploadingItem(entry.itemId);
+          setUploadingPhotoId(entry.photoId);
           setUploadStage('uploading');
           setUploadProgress(0);
           const file = dataUrlToFile(entry.dataUrl, entry.fileName, entry.fileType);
           const uploaded = await uploadAuditPhotoWithMeta(audit.id, file, (progress) => setUploadProgress(progress));
-          updateItem(entry.sectionId, entry.itemId, {
-            photoUrl: uploaded.downloadURL,
-            photoPath: uploaded.storagePath,
-            photoDataUrl: entry.dataUrl,
+
+          // Update the specific photo slot in item.photos[]
+          setAudit((prev) => {
+            if (!prev) return prev;
+            const newSections = prev.sections.map((section) => {
+              if (section.id !== entry.sectionId) return section;
+              return {
+                ...section,
+                items: section.items.map((item) => {
+                  if (item.id !== entry.itemId) return item;
+                  return {
+                    ...item,
+                    photos: (item.photos || []).map((photo) =>
+                      photo.id === entry.photoId
+                        ? { ...photo, url: uploaded.downloadURL, path: uploaded.storagePath, pending: false, dataUrl: entry.dataUrl }
+                        : photo,
+                    ),
+                  };
+                }),
+              };
+            });
+            const updated = { ...prev, sections: newSections, updatedAt: new Date().toISOString() };
+            void saveAudit(updated);
+            return updated;
           });
+
           const nextQueue = removePendingUpload(entry.id);
           setPendingUploads(nextQueue.filter((p) => p.auditId === audit.id));
+          clearObjectPreview(entry.photoId);
           setLocalPreviews((prev) => {
             const next = { ...prev };
-            delete next[entry.itemId];
+            delete next[entry.photoId];
             return next;
           });
           setUploadErrors((prev) => {
             const next = { ...prev };
-            delete next[entry.itemId];
+            delete next[entry.photoId];
             return next;
           });
         } catch (error) {
@@ -293,19 +359,20 @@ export default function Checklist() {
             ? error.message
             : 'Photo upload stalled due to poor network. Please check connection and tap Retry.';
           updatePendingUploadError(entry.id, message);
-          setUploadErrors((prev) => ({ ...prev, [entry.itemId]: message }));
+          setUploadErrors((prev) => ({ ...prev, [entry.photoId]: message }));
         }
       }
     } finally {
       setIsSyncingQueue(false);
       setUploadStage('idle');
-      setUploadingItem(null);
+      setUploadingPhotoId(null);
       setUploadProgress(0);
     }
   };
 
   const handlePhotoClick = (sectionId: string, itemId: string) => {
-    setCurrentUploadTarget({ sectionId, itemId });
+    const photoId = createId('photo');
+    setCurrentUploadTarget({ sectionId, itemId, photoId });
     fileInputRef.current?.click();
   };
 
@@ -314,22 +381,61 @@ export default function Checklist() {
     if (!file || !currentUploadTarget || !audit) return;
 
     const target = currentUploadTarget;
+    const { sectionId, itemId, photoId } = target;
+
     let previewDataUrl = '';
 
-    // Show thumbnail immediately, even if upload is pending.
+    // 1. Append the new photo slot immediately (pending=true) so the thumbnail appears
+    setObjectPreview(photoId, file);
+    setAudit((prev) => {
+      if (!prev) return prev;
+      const newSections = prev.sections.map((section) => {
+        if (section.id !== sectionId) return section;
+        return {
+          ...section,
+          items: section.items.map((item) => {
+            if (item.id !== itemId) return item;
+            const newPhoto: ItemPhoto = { id: photoId, pending: true };
+            return { ...item, photos: [...(item.photos || []), newPhoto] };
+          }),
+        };
+      });
+      return { ...prev, sections: newSections };
+    });
+
+    // 2. Start dataUrl conversion in background (for offline cache)
     try {
       previewDataUrl = await fileToDataUrl(file);
-      setLocalPreviews((prev) => ({ ...prev, [target.itemId]: previewDataUrl }));
-      updateItem(target.sectionId, target.itemId, { photoDataUrl: previewDataUrl });
+      setPersistentPreview(photoId, previewDataUrl);
+      // Update photoDataUrl in the photo slot
+      setAudit((prev) => {
+        if (!prev) return prev;
+        const newSections = prev.sections.map((section) => {
+          if (section.id !== sectionId) return section;
+          return {
+            ...section,
+            items: section.items.map((item) => {
+              if (item.id !== itemId) return item;
+              return {
+                ...item,
+                photos: (item.photos || []).map((photo) =>
+                  photo.id === photoId ? { ...photo, dataUrl: previewDataUrl } : photo,
+                ),
+              };
+            }),
+          };
+        });
+        return { ...prev, sections: newSections };
+      });
     } catch {
-      // Ignore preview conversion failures.
+      // Continue without dataUrl in this slot
     }
 
-    setUploadingItem(target.itemId);
+    setUploadingPhotoId(photoId);
     setUploadProgress(0);
     setUploadStage('compressing');
+
     try {
-      // Compress for field networks (target <= 3MB).
       let uploadCandidate = file;
       try {
         uploadCandidate = await withTimeout(
@@ -338,45 +444,116 @@ export default function Checklist() {
           12000
         );
       } catch (compressionError) {
-        console.warn('⚠️ Compression failed, uploading original image:', compressionError);
+        console.warn('⚠️ Compression failed, uploading original:', compressionError);
         uploadCandidate = file;
       }
 
       if (!isOnline) {
         await queuePendingPhoto(
-          uploadCandidate,
-          target.sectionId,
-          target.itemId,
+          uploadCandidate, sectionId, itemId, photoId,
           'Photo upload stalled due to poor network. Please check connection and tap Retry.',
+          previewDataUrl || undefined,
         );
+        // Mark as pending in state
+        setAudit((prev) => {
+          if (!prev) return prev;
+          const newSections = prev.sections.map((section) => {
+            if (section.id !== sectionId) return section;
+            return {
+              ...section,
+              items: section.items.map((item) => {
+                if (item.id !== itemId) return item;
+                return {
+                  ...item,
+                  photos: (item.photos || []).map((photo) =>
+                    photo.id === photoId ? { ...photo, pending: true } : photo,
+                  ),
+                };
+              }),
+            };
+          });
+          const updated = { ...prev, sections: newSections, updatedAt: new Date().toISOString() };
+          void saveAudit(updated);
+          return updated;
+        });
         return;
       }
 
       setUploadStage('uploading');
 
-      const uploaded = await uploadAuditPhotoWithMeta(audit.id, uploadCandidate, (progress) => setUploadProgress(progress));
+      const uploaded = await uploadAuditPhotoWithMeta(
+        audit.id,
+        uploadCandidate,
+        (progress) => setUploadProgress(progress),
+        { maxAttempts: 1, stallTimeoutMs: 15000 }
+      );
 
-      updateItem(target.sectionId, target.itemId, {
-        photoUrl: uploaded.downloadURL,
-        photoPath: uploaded.storagePath,
-        photoDataUrl: previewDataUrl || undefined,
+      // Mark photo as uploaded
+      setAudit((prev) => {
+        if (!prev) return prev;
+        const newSections = prev.sections.map((section) => {
+          if (section.id !== sectionId) return section;
+          return {
+            ...section,
+            items: section.items.map((item) => {
+              if (item.id !== itemId) return item;
+              return {
+                ...item,
+                photos: (item.photos || []).map((photo) =>
+                  photo.id === photoId
+                    ? { ...photo, url: uploaded.downloadURL, path: uploaded.storagePath, pending: false, dataUrl: previewDataUrl || photo.dataUrl }
+                    : photo,
+                ),
+              };
+            }),
+          };
+        });
+        const updated = { ...prev, sections: newSections, updatedAt: new Date().toISOString() };
+        void saveAudit(updated);
+        return updated;
       });
-      clearPendingForItem(target.itemId);
+
+      clearObjectPreview(photoId);
+      setLocalPreviews((prev) => {
+        const next = { ...prev };
+        delete next[photoId];
+        return next;
+      });
+
       console.log('✅ Photo successfully uploaded:', uploaded.downloadURL);
     } catch (error) {
       console.error('❌ Photo upload failed:', error);
       const errorMsg = error instanceof Error
         ? error.message
         : 'Photo upload stalled due to poor network. Please check connection and tap Retry.';
-      await queuePendingPhoto(file, target.sectionId, target.itemId, errorMsg);
-      alert('Photo upload stalled due to poor network. Please check connection and tap Retry.');
+      await queuePendingPhoto(file, sectionId, itemId, photoId, errorMsg, previewDataUrl || undefined);
     } finally {
       setUploadStage('idle');
-      setUploadingItem(null);
+      setUploadingPhotoId(null);
       setUploadProgress(0);
       setCurrentUploadTarget(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
+  };
+
+  const deleteItemPhoto = (sectionId: string, itemId: string, photoId: string) => {
+    clearPendingForPhoto(photoId);
+    setAudit((prev) => {
+      if (!prev) return prev;
+      const newSections = prev.sections.map((section) => {
+        if (section.id !== sectionId) return section;
+        return {
+          ...section,
+          items: section.items.map((item) => {
+            if (item.id !== itemId) return item;
+            return { ...item, photos: (item.photos || []).filter((photo) => photo.id !== photoId) };
+          }),
+        };
+      });
+      const updated = { ...prev, sections: newSections, updatedAt: new Date().toISOString() };
+      void saveAudit(updated);
+      return updated;
+    });
   };
 
   const updateSectionNotes = (sectionId: string, notes: string) => {
@@ -496,6 +673,14 @@ export default function Checklist() {
                         .sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0))
                         .map((item) => {
                           const subsectionTitle = section.subsections?.find((sub) => sub.id === item.subsectionId)?.title;
+                          // Collect all photos: new array + legacy single-photo fallback for backward compat
+                          const allPhotos: ItemPhoto[] = item.photos && item.photos.length > 0
+                            ? item.photos
+                            : (item.photoUrl || item.photoDataUrl)
+                              ? [{ id: `legacy-${item.id}`, url: item.photoUrl, dataUrl: item.photoDataUrl, path: item.photoPath }]
+                              : [];
+                          const hasAttachedPhoto = allPhotos.length > 0;
+                          const isUploadingForThisItem = allPhotos.some((p) => p.id === uploadingPhotoId) || uploadingPhotoId?.startsWith('photo-') && currentUploadTarget?.itemId === item.id;
                           return (
                         <div key={item.id} className="space-y-4">
                           {subsectionTitle && (
@@ -616,122 +801,133 @@ export default function Checklist() {
                               )}
                             </div>
 
-                            <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_96px] gap-3 items-start">
-                              <div className="space-y-3 min-w-0">
-                                <div className="relative">
-                                  <MessageSquare className="absolute left-3 top-3 w-4 h-4 text-slate-400" />
-                                  <textarea
-                                    placeholder="Add comments..."
-                                    className="input min-h-[88px] resize-none pl-10 py-2 text-sm"
-                                    value={item.comment}
-                                    required={Boolean(item.notesRequired && item.status !== 'na')}
-                                    onChange={(e) => updateItem(section.id, item.id, { comment: e.target.value })}
-                                  />
-                                </div>
-
-                                <div className="flex items-center gap-2">
-                                  <button 
-                                    onClick={() => handlePhotoClick(section.id, item.id)}
-                                    disabled={uploadingItem === item.id || item.photosAllowed === false}
-                                    className={cn(
-                                      "btn p-2 aspect-square",
-                                      item.photoUrl ? "bg-green-50 text-green-600 border-green-200" : "btn-secondary"
-                                    )}
-                                    title={item.photosAllowed === false ? 'Photo upload disabled for this item' : (uploadingItem === item.id ? (uploadStage === 'compressing' ? 'Compressing image...' : 'Uploading image...') : 'Upload photo')}
-                                  >
-                                    {uploadingItem === item.id ? (
-                                      <Loader2 className="w-5 h-5 animate-spin" />
-                                    ) : (
-                                      <Camera className="w-5 h-5" />
-                                    )}
-                                  </button>
-                                  <span className="text-xs text-slate-500">
-                                    {item.photosAllowed === false ? 'Photo disabled for this item' : (item.photoUrl || localPreviews[item.id]) ? 'Photo attached' : 'Add evidence photo'}
-                                  </span>
-                                </div>
-
-                                <div className="min-h-[44px]">
-                                  {uploadingItem === item.id && (
-                                    <div className="space-y-1">
-                                      <p className="text-xs text-slate-500">
-                                        {uploadStage === 'compressing' ? 'Preparing photo...' : `Uploading photo... ${uploadProgress}%`}
-                                      </p>
-                                      {uploadStage === 'uploading' && (
-                                        <div className="h-1.5 w-full bg-slate-200 rounded-full overflow-hidden">
-                                          <div className="h-full bg-slate-900" style={{ width: `${uploadProgress}%` }} />
-                                        </div>
-                                      )}
-                                    </div>
-                                  )}
-
-                                  {uploadErrors[item.id] && (
-                                    <div className="rounded-lg border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900 flex items-center justify-between gap-2">
-                                      <span>Photo upload stalled due to poor network. Please check connection and tap Retry.</span>
-                                      <button
-                                        type="button"
-                                        className="btn btn-secondary px-2 py-1 text-[11px]"
-                                        onClick={() => void syncPendingUploads(item.id)}
-                                        disabled={!isOnline || isSyncingQueue}
-                                      >
-                                        Retry Upload
-                                      </button>
-                                    </div>
-                                  )}
-                                </div>
+                            <div className="space-y-3">
+                              <div className="relative">
+                                <MessageSquare className="absolute left-3 top-3 w-4 h-4 text-slate-400" />
+                                <textarea
+                                  placeholder="Add comments..."
+                                  className="input min-h-[88px] resize-none pl-10 py-2 text-sm"
+                                  value={item.comment}
+                                  required={Boolean(item.notesRequired && item.status !== 'na')}
+                                  onChange={(e) => updateItem(section.id, item.id, { comment: e.target.value })}
+                                />
                               </div>
 
-                              <div className="w-24 h-24 rounded-xl overflow-hidden border border-slate-200 shadow-sm group bg-slate-50 flex items-center justify-center relative">
-                                {(item.photoUrl || localPreviews[item.id]) ? (
-                                  <>
-                                    <img 
-                                      src={item.photoUrl || localPreviews[item.id]} 
-                                      alt="Evidence" 
-                                      className="w-full h-full object-cover"
-                                      referrerPolicy="no-referrer"
-                                    />
-                                    {item.photoUrl && (
-                                      <div className="absolute bottom-1 left-1 right-1 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                        <button
-                                          onClick={() => {
-                                            if (!item.photoUrl) return;
-                                            window.open(item.photoUrl, '_blank', 'noopener,noreferrer');
-                                          }}
-                                          className="flex-1 bg-white/90 text-slate-700 p-1 rounded text-[10px] font-semibold flex items-center justify-center gap-1"
-                                          title="View photo"
-                                        >
-                                          <ExternalLink className="w-3 h-3" />
-                                          View
-                                        </button>
-                                        <a
-                                          href={item.photoUrl}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                          download
-                                          className="flex-1 bg-white/90 text-slate-700 p-1 rounded text-[10px] font-semibold flex items-center justify-center gap-1"
-                                          title="Download photo"
-                                        >
-                                          <Download className="w-3 h-3" />
-                                          Save
-                                        </a>
+                              {/* Multi-photo gallery strip */}
+                              <div className="space-y-2">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  {/* Thumbnail strip */}
+                                  {allPhotos.map((photo, photoIdx) => {
+                                    const src = photo.url || localPreviews[photo.id] || photo.dataUrl || '';
+                                    const isUploading = photo.id === uploadingPhotoId;
+                                    const isPending = photo.pending && !photo.url;
+                                    const hasError = Boolean(uploadErrors[photo.id]);
+                                    return (
+                                      <div
+                                        key={photo.id}
+                                        className="relative w-16 h-16 rounded-lg overflow-hidden border border-slate-200 shadow-sm group bg-slate-50 flex items-center justify-center flex-shrink-0"
+                                      >
+                                        {src ? (
+                                          <img
+                                            src={src}
+                                            alt={`Evidence ${photoIdx + 1}`}
+                                            className="w-full h-full object-cover"
+                                            referrerPolicy="no-referrer"
+                                          />
+                                        ) : (
+                                          <div className="text-[9px] text-slate-400 text-center px-1">No preview</div>
+                                        )}
+                                        {isUploading && (
+                                          <div className="absolute inset-0 bg-slate-900/60 flex flex-col items-center justify-center gap-0.5">
+                                            <Loader2 className="w-4 h-4 text-white animate-spin" />
+                                            {uploadStage === 'uploading' && (
+                                              <span className="text-[9px] text-white font-bold">{uploadProgress}%</span>
+                                            )}
+                                          </div>
+                                        )}
+                                        {isPending && !isUploading && (
+                                          <div className="absolute inset-x-0 bottom-0 bg-amber-500/80 text-white text-[8px] font-bold text-center py-0.5">
+                                            Pending
+                                          </div>
+                                        )}
+                                        {hasError && !isUploading && (
+                                          <div className="absolute inset-x-0 bottom-0 bg-red-500/80 text-white text-[8px] font-bold text-center py-0.5">
+                                            Failed
+                                          </div>
+                                        )}
+                                        {/* Hover overlay: expand + delete */}
+                                        <div className="absolute inset-0 bg-slate-900/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-1">
+                                          {src && (
+                                            <button
+                                              type="button"
+                                              onClick={() => setLightboxState({ itemId: item.id, photos: allPhotos, photoIndex: photoIdx })}
+                                              className="bg-white/90 text-slate-800 rounded p-1"
+                                              title="View full size"
+                                            >
+                                              <ZoomIn className="w-3 h-3" />
+                                            </button>
+                                          )}
+                                          <button
+                                            type="button"
+                                            onClick={() => deleteItemPhoto(section.id, item.id, photo.id)}
+                                            className="bg-red-500 text-white rounded p-1"
+                                            title="Remove photo"
+                                          >
+                                            <X className="w-3 h-3" />
+                                          </button>
+                                        </div>
                                       </div>
-                                    )}
-                                    {localPreviews[item.id] && !item.photoUrl && (
-                                      <div className="absolute inset-x-0 bottom-0 bg-slate-900/70 text-white text-[10px] font-bold text-center py-0.5">
-                                        Pending Sync
-                                      </div>
-                                    )}
-                                    <button 
-                                      onClick={() => {
-                                        updateItem(section.id, item.id, { photoUrl: '', photoPath: '', photoDataUrl: '' });
-                                        clearPendingForItem(item.id);
-                                      }}
-                                      className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                                    );
+                                  })}
+
+                                  {/* Add photo button */}
+                                  {item.photosAllowed !== false && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handlePhotoClick(section.id, item.id)}
+                                      disabled={isUploadingForThisItem}
+                                      className={cn(
+                                        'w-16 h-16 rounded-lg border-2 border-dashed flex flex-col items-center justify-center gap-1 flex-shrink-0 transition-colors',
+                                        hasAttachedPhoto
+                                          ? 'border-green-300 bg-green-50 text-green-600 hover:bg-green-100'
+                                          : 'border-slate-300 bg-slate-50 text-slate-400 hover:bg-slate-100'
+                                      )}
+                                      title={isUploadingForThisItem ? 'Uploading...' : 'Add photo'}
                                     >
-                                      <X className="w-3 h-3" />
+                                      {isUploadingForThisItem ? (
+                                        <Loader2 className="w-5 h-5 animate-spin" />
+                                      ) : (
+                                        <>
+                                          <ImagePlus className="w-4 h-4" />
+                                          <span className="text-[9px] font-semibold leading-none">
+                                            {hasAttachedPhoto ? 'Add more' : 'Add photo'}
+                                          </span>
+                                        </>
+                                      )}
                                     </button>
-                                  </>
-                                ) : (
-                                  <div className="text-[11px] font-medium text-slate-400 text-center px-2">No photo</div>
+                                  )}
+                                </div>
+
+                                {/* Upload progress bar */}
+                                {isUploadingForThisItem && uploadStage === 'uploading' && (
+                                  <div className="h-1.5 w-full bg-slate-200 rounded-full overflow-hidden">
+                                    <div className="h-full bg-slate-900 transition-all" style={{ width: `${uploadProgress}%` }} />
+                                  </div>
+                                )}
+
+                                {/* Per-photo error messages */}
+                                {allPhotos.some((p) => uploadErrors[p.id]) && (
+                                  <div className="rounded-lg border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900 flex items-center justify-between gap-2">
+                                    <span>Photo upload stalled due to poor network. Please check connection and tap Retry.</span>
+                                    <button
+                                      type="button"
+                                      className="btn btn-secondary px-2 py-1 text-[11px]"
+                                      onClick={() => void syncPendingUploads()}
+                                      disabled={!isOnline || isSyncingQueue}
+                                    >
+                                      Retry Upload
+                                    </button>
+                                  </div>
                                 )}
                               </div>
                             </div>
@@ -787,6 +983,92 @@ export default function Checklist() {
           </button>
         </div>
       </div>
+
+      {/* Lightbox */}
+      <AnimatePresence>
+        {lightboxState && (() => {
+          const { photos: lbPhotos, photoIndex } = lightboxState;
+          const photo = lbPhotos[photoIndex];
+          const src = photo?.url || localPreviews[photo?.id] || photo?.dataUrl || '';
+          const hasPrev = photoIndex > 0;
+          const hasNext = photoIndex < lbPhotos.length - 1;
+          return (
+            <motion.div
+              key="lightbox"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50 bg-slate-950/90 flex items-center justify-center p-4"
+              onClick={() => setLightboxState(null)}
+            >
+              <div className="relative max-w-3xl w-full flex flex-col items-center gap-4" onClick={(e) => e.stopPropagation()}>
+                {/* Counter */}
+                <div className="text-white text-sm font-semibold">
+                  {photoIndex + 1} / {lbPhotos.length}
+                </div>
+
+                {/* Image */}
+                <div className="w-full flex items-center justify-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => hasPrev && setLightboxState((s) => s ? { ...s, photoIndex: s.photoIndex - 1 } : s)}
+                    disabled={!hasPrev}
+                    className="p-2 rounded-full bg-white/10 text-white disabled:opacity-30 hover:bg-white/20 transition-colors"
+                  >
+                    <ChevronLeft className="w-6 h-6" />
+                  </button>
+
+                  <div className="flex-1 flex items-center justify-center">
+                    {src ? (
+                      <img
+                        src={src}
+                        alt={`Evidence ${photoIndex + 1}`}
+                        className="max-h-[70vh] max-w-full rounded-xl object-contain shadow-2xl"
+                        referrerPolicy="no-referrer"
+                      />
+                    ) : (
+                      <div className="text-slate-400 text-sm">Image not available</div>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => hasNext && setLightboxState((s) => s ? { ...s, photoIndex: s.photoIndex + 1 } : s)}
+                    disabled={!hasNext}
+                    className="p-2 rounded-full bg-white/10 text-white disabled:opacity-30 hover:bg-white/20 transition-colors"
+                  >
+                    <ChevronRight className="w-6 h-6" />
+                  </button>
+                </div>
+
+                {/* Actions */}
+                <div className="flex gap-3">
+                  {src && photo?.url && (
+                    <a
+                      href={photo.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      download
+                      className="btn btn-secondary gap-2 text-white border-white/20 bg-white/10 hover:bg-white/20"
+                    >
+                      <Download className="w-4 h-4" />
+                      Download
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setLightboxState(null)}
+                    className="btn btn-secondary gap-2 text-white border-white/20 bg-white/10 hover:bg-white/20"
+                  >
+                    <X className="w-4 h-4" />
+                    Close
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          );
+        })()}
+      </AnimatePresence>
     </Layout>
   );
 }

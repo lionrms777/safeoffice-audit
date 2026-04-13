@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import Layout from '../components/Layout';
 import { useAudits } from '../AuditContext';
-import { Audit, RiskBand } from '../types';
+import { Audit } from '../types';
 import { DEFAULT_NARRATIVE } from '../constants';
 import {
   CheckCircle, AlertTriangle, Send, Edit3, User, MapPin, Calendar,
@@ -11,36 +11,7 @@ import {
 } from 'lucide-react';
 import { formatDate, cn } from '../lib/utils';
 import { calculateGeneralComplianceMetrics } from '../lib/compliance';
-
-function riskBadge(band: RiskBand) {
-  const cls: Record<RiskBand, string> = {
-    'Very High': 'bg-red-600 text-white',
-    'High': 'bg-orange-500 text-white',
-    'Moderate': 'bg-amber-400 text-slate-900',
-    'Low': 'bg-green-600 text-white',
-  };
-  return cn('px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide', cls[band]);
-}
-
-function priorityBadge(priority: string) {
-  const cls: Record<string, string> = {
-    Urgent: 'bg-red-600 text-white',
-    Critical: 'bg-red-700 text-white',
-    High: 'bg-orange-500 text-white',
-    Medium: 'bg-amber-400 text-slate-900',
-    Low: 'bg-green-600 text-white',
-  };
-  return cn('px-2 py-0.5 rounded text-[10px] font-bold uppercase', cls[priority] || 'bg-slate-100 text-slate-700');
-}
-
-function statusBadge(status: string) {
-  const cls: Record<string, string> = {
-    Open: 'bg-red-50 text-red-700',
-    'In Progress': 'bg-blue-50 text-blue-700',
-    Closed: 'bg-green-50 text-green-700',
-  };
-  return cn('px-2 py-0.5 rounded-full text-[10px] font-bold uppercase', cls[status] || 'bg-slate-100 text-slate-600');
-}
+import { FindingsRegisterTable, ActionPlanTable } from '../components/ReportTables';
 
 interface NarrativeBlockProps {
   icon: React.ReactNode;
@@ -322,10 +293,10 @@ export default function Summary() {
         </section>
 
         {/* ── Findings ── */}
-        <section>
-          <div className="flex items-center justify-between mb-3">
+        <section className="space-y-3">
+          <div className="flex items-center justify-between gap-3">
             <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-              <ListChecks className="w-4 h-4" /> Findings ({audit.findings?.length || 0})
+              <ListChecks className="w-4 h-4" /> Findings Register
             </h3>
             <button
               onClick={() => navigate(`/audit/${audit.id}/findings`)}
@@ -334,68 +305,17 @@ export default function Summary() {
               <Edit3 className="w-3.5 h-3.5" /> Edit Findings
             </button>
           </div>
-          <div className="space-y-3">
-            {(audit.findings || []).map((finding, idx) => (
-              <div key={finding.id} className="card p-4 border-l-4 border-l-red-500 space-y-2">
-                <div className="flex justify-between items-start">
-                  <div>
-                    <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{finding.sectionTitle}</span>
-                    <h4 className="font-semibold text-slate-900 text-sm">F{idx + 1}. {finding.title}</h4>
-                  </div>
-                  <span className={riskBadge(finding.riskBand)}>{finding.riskBand} ({finding.riskScore})</span>
-                </div>
-                <p className="text-xs text-slate-600 leading-relaxed">{finding.observation}</p>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className={priorityBadge(finding.priority)}>{finding.priority}</span>
-                  <span className={statusBadge(finding.status)}>{finding.status}</span>
-                  {finding.responsiblePerson && <span className="text-xs text-slate-500">{finding.responsiblePerson}</span>}
-                  {finding.targetDate && <span className="text-xs text-slate-500">{formatDate(finding.targetDate)}</span>}
-                </div>
-              </div>
-            ))}
-            {(!audit.findings || audit.findings.length === 0) && (
-              <div className="p-8 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200">
-                <p className="text-slate-400 text-sm italic">No findings recorded.</p>
-              </div>
-            )}
-          </div>
+          <p className="text-sm text-slate-500">Each issue is recorded once here with evidence, inspector notes, risk rating, and a short ref to the linked action.</p>
+          <FindingsRegisterTable audit={audit} />
         </section>
 
         {/* ── Action Plan ── */}
-        <section>
-          <h3 className="text-base font-bold text-slate-900 mb-3 flex items-center gap-2">
+        <section className="space-y-3">
+          <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
             <TableIcon className="w-4 h-4" /> Action Plan
           </h3>
-          <div className="overflow-x-auto -mx-4 px-4">
-            <table className="w-full text-left border-collapse min-w-[820px] text-sm">
-              <thead className="bg-slate-800 text-white text-[10px] uppercase tracking-wider font-bold">
-                <tr>
-                  {['Ref','Linked Finding','Action Required','Priority','L','S','Score','Responsible','Target Date','Status'].map(h => (
-                    <th key={h} className="px-3 py-3 border-b border-slate-600 whitespace-nowrap">{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody className="text-xs">
-                {(audit.actions || []).map((action, idx) => (
-                  <tr key={action.id} className="hover:bg-slate-50 transition-colors">
-                    <td className="px-3 py-3 border-b border-slate-100 font-mono font-bold">A{idx + 1}</td>
-                    <td className="px-3 py-3 border-b border-slate-100 max-w-[120px] truncate">{action.findingTitle || '-'}</td>
-                    <td className="px-3 py-3 border-b border-slate-100 font-medium max-w-[200px]">{action.actionRequired}</td>
-                    <td className="px-3 py-3 border-b border-slate-100"><span className={priorityBadge(action.priority)}>{action.priority}</span></td>
-                    <td className="px-3 py-3 border-b border-slate-100 text-center font-semibold">{action.likelihood}</td>
-                    <td className="px-3 py-3 border-b border-slate-100 text-center font-semibold">{action.severity}</td>
-                    <td className="px-3 py-3 border-b border-slate-100 text-center font-bold">{action.riskScore}</td>
-                    <td className="px-3 py-3 border-b border-slate-100">{action.responsiblePerson || '-'}</td>
-                    <td className="px-3 py-3 border-b border-slate-100 whitespace-nowrap">{action.targetDate ? formatDate(action.targetDate) : '-'}</td>
-                    <td className="px-3 py-3 border-b border-slate-100"><span className={statusBadge(action.status)}>{action.status}</span></td>
-                  </tr>
-                ))}
-                {(!audit.actions || audit.actions.length === 0) && (
-                  <tr><td colSpan={10} className="px-4 py-8 text-center text-slate-400 italic">No actions required.</td></tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+          <p className="text-sm text-slate-500">Actions are linked back to the findings register by ref and only show what must be done next.</p>
+          <ActionPlanTable audit={audit} />
         </section>
 
         {/* ── Conclusion ── */}

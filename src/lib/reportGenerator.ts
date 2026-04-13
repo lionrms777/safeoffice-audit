@@ -22,6 +22,7 @@ import { saveAs } from 'file-saver';
 import { Audit } from '../types';
 import { formatDate } from './utils';
 import { getPhotoBytesByPreference } from './firebaseStorage';
+import { buildReportActionRows, buildReportFindingRows } from './reportTables';
 
 type DocxImageType = 'png' | 'jpg' | 'gif' | 'bmp';
 
@@ -64,6 +65,22 @@ function getRiskTextColor(value?: string): string {
   if (level === 'high') return '991B1B';
   if (level === 'medium') return '92400E';
   return '166534';
+}
+
+function getStatusFill(status?: string): string {
+  const value = (status || '').toLowerCase();
+  if (value.includes('closed')) return 'EAF7EE';
+  if (value.includes('progress')) return 'E8F1FD';
+  if (value.includes('open')) return 'FDE8E8';
+  return 'F8FAFC';
+}
+
+function getStatusTextColor(status?: string): string {
+  const value = (status || '').toLowerCase();
+  if (value.includes('closed')) return '166534';
+  if (value.includes('progress')) return '1D4ED8';
+  if (value.includes('open')) return '991B1B';
+  return '475569';
 }
 
 function getComplianceFill(score: number): string {
@@ -626,31 +643,8 @@ export async function generateAuditReport(audit: Audit) {
   const executiveSummaryText = getExecutiveSummary(audit);
   const generatedOn = new Date().toISOString();
 
-  const uniqueFindings = (audit.findings || [])
-    .filter((finding, index, arr) => arr.findIndex((f) => f.itemId === finding.itemId) === index)
-    .sort((a, b) => {
-      const sectionCompare = a.sectionTitle.localeCompare(b.sectionTitle);
-      if (sectionCompare !== 0) return sectionCompare;
-      const riskCompare = b.riskScore - a.riskScore;
-      if (riskCompare !== 0) return riskCompare;
-      return a.title.localeCompare(b.title);
-    });
-
-  // Map finding.id → 1-based index (F1, F2, …) based on the sorted Findings Register order
-  const findingRefMap = new Map<string, number>();
-  uniqueFindings.forEach((f, i) => findingRefMap.set(f.id, i + 1));
-
-  const uniqueActions = (audit.actions || [])
-    .filter((action, index, arr) => arr.findIndex((a) => a.id === action.id) === index)
-    .sort((a, b) => {
-      // Sort by the finding's F-number so Action Plan order mirrors Findings Register
-      const aFRef = findingRefMap.get(a.findingId) ?? Number.MAX_SAFE_INTEGER;
-      const bFRef = findingRefMap.get(b.findingId) ?? Number.MAX_SAFE_INTEGER;
-      if (aFRef !== bFRef) return aFRef - bFRef;
-      const riskCompare = b.riskScore - a.riskScore;
-      if (riskCompare !== 0) return riskCompare;
-      return a.actionRequired.localeCompare(b.actionRequired);
-    });
+  const findingRowsMeta = buildReportFindingRows(audit);
+  const actionRows = buildReportActionRows(audit, findingRowsMeta);
 
   const positiveObservationSections = audit.sections.map((section) => {
     const positiveItems = section.items.filter((item) => item.status === 'positive');
@@ -669,45 +663,30 @@ export async function generateAuditReport(audit: Audit) {
         ? observedLines
         : ['No positive observations recorded.'],
       photos: positiveItems
-        .filter((item) => Boolean(item.photoUrl || item.photoPath || item.photoDataUrl))
-        .map((item) => ({
-          photoUrl: item.photoUrl || '',
-          photoPath: item.photoPath || '',
-          photoDataUrl: item.photoDataUrl || '',
-          hasPhotoRef: Boolean(item.photoUrl || item.photoPath || item.photoDataUrl),
-        })),
+        .flatMap((item) => {
+          // Prefer new photos[] array; fall back to legacy single-photo fields
+          if (item.photos && item.photos.length > 0) {
+            return item.photos.map((photo) => ({
+              photoUrl: photo.url || '',
+              photoPath: photo.path || '',
+              photoDataUrl: photo.dataUrl || '',
+              hasPhotoRef: Boolean(photo.url || photo.path || photo.dataUrl),
+            }));
+          }
+          if (item.photoUrl || item.photoPath || item.photoDataUrl) {
+            return [{
+              photoUrl: item.photoUrl || '',
+              photoPath: item.photoPath || '',
+              photoDataUrl: item.photoDataUrl || '',
+              hasPhotoRef: true,
+            }];
+          }
+          return [];
+        }),
     };
   });
 
   // Fetch ALL images in a single parallel batch (cover + every finding photo)
-  const findingRowsMeta = uniqueFindings.map((finding, index) => {
-    const section = audit.sections.find(s => s.id === finding.sectionId);
-    const item = section?.items.find(i => i.id === finding.itemId);
-    return {
-      ...finding,
-      finding,
-      refCode: `F${index + 1}`,
-      rowKind: 'finding' as const,
-      sectionTitle: finding.sectionTitle,
-      title: finding.title,
-      observation: finding.observation,
-      recommendedAction: finding.recommendedAction,
-      likelihood: finding.likelihood,
-      severity: finding.severity,
-      riskScore: finding.riskScore,
-      riskBand: finding.riskBand,
-      priority: finding.priority,
-      targetDate: finding.targetDate,
-      responsiblePerson: finding.responsiblePerson,
-      status: finding.status,
-      photoUrl: item?.photoUrl || '',
-      photoPath: item?.photoPath || '',
-      photoDataUrl: item?.photoDataUrl || '',
-      itemComment: item?.comment || '',
-      hasPhotoRef: Boolean(item?.photoUrl || item?.photoPath || item?.photoDataUrl),
-    };
-  });
-
   const [logoAsset, buildingAsset] = await Promise.all([
     (audit.siteLogoPath || audit.siteLogoUrl)
       ? loadImageAsset(audit.siteLogoPath, audit.siteLogoUrl, 45000)
@@ -722,24 +701,28 @@ export async function generateAuditReport(audit: Audit) {
     buildingAsset || loadImageAssetFromDataUrl(audit.siteBuildingPhotoDataUrl),
   ]);
 
-  const findingAssets = await Promise.all(
-    findingRowsMeta.map(({ photoPath, photoUrl }) =>
-      (photoPath || photoUrl) ? loadImageAsset(photoPath, photoUrl) : Promise.resolve(null)
-    )
+  const findingsWithImages = await Promise.all(
+    findingRowsMeta.map(async ({ hasPhotoRef, inspectorNotes, photos, ...row }) => {
+      const resolvedPhotos = await Promise.all(
+        photos.map(async ({ photoUrl, photoPath, photoDataUrl }) => {
+          let asset: ImageAsset | null = null;
+          if (photoPath || photoUrl) {
+            try { asset = await loadImageAsset(photoPath, photoUrl); } catch { /* fall through */ }
+          }
+          if (!asset && photoDataUrl) {
+            asset = await loadImageAssetFromDataUrl(photoDataUrl);
+          }
+          return {
+            imageData: asset?.data ?? null,
+            imageType: (asset?.type ?? 'png') as DocxImageType,
+            imageWidth: asset?.width ?? 800,
+            imageHeight: asset?.height ?? 600,
+          };
+        }),
+      );
+      return { ...row, hasPhotoRef, inspectorNotes, resolvedPhotos };
+    }),
   );
-
-  const findingsWithImages = await Promise.all(findingRowsMeta.map(async ({ hasPhotoRef, itemComment, photoDataUrl, ...row }, i) => {
-    const asset = findingAssets[i] || await loadImageAssetFromDataUrl(photoDataUrl);
-    return {
-      ...row,
-      hasPhotoRef,
-      itemComment,
-      imageData: asset?.data ?? null,
-      imageType: (asset?.type ?? 'png') as DocxImageType,
-      imageWidth: asset?.width ?? 800,
-      imageHeight: asset?.height ?? 600,
-    };
-  }));
 
   const positivePhotoEntries = positiveObservationSections.flatMap((section) => section.photos);
   const positivePhotoAssets = await Promise.all(
@@ -769,7 +752,7 @@ export async function generateAuditReport(audit: Audit) {
 
   const referencedPhotoCount = findingsWithImages.filter((entry) => entry.hasPhotoRef).length
     + positiveObservationSectionsWithImages.flatMap((section) => section.photos).filter((photo) => photo.hasPhotoRef).length;
-  const embeddedPhotoCount = findingsWithImages.filter((entry) => Boolean(entry.imageData)).length
+  const embeddedPhotoCount = findingsWithImages.reduce((sum, entry) => sum + entry.resolvedPhotos.filter((p) => Boolean(p.imageData)).length, 0)
     + positiveObservationSectionsWithImages.flatMap((section) => section.photos).filter((photo) => Boolean(photo.imageData)).length;
 
   const generatedDate = formatDate(generatedOn);
@@ -1134,7 +1117,7 @@ export async function generateAuditReport(audit: Audit) {
                 new Table({
                   width: { size: 100, type: WidthType.PERCENTAGE },
                   layout: TableLayoutType.FIXED,
-                  columnWidths: [650, 1800, 2550, 1800, 950, 1500, 1650],
+                  columnWidths: [650, 1800, 3150, 1750, 950, 1400],
                   borders: defaultTableBorders(),
                   rows: [
                     new TableRow({
@@ -1142,62 +1125,46 @@ export async function generateAuditReport(audit: Audit) {
                         createActionHeaderCell('Ref'),
                         createActionHeaderCell('Section'),
                         createActionHeaderCell('Finding / Observation'),
-                        createActionHeaderCell('Recommended Action'),
-                        createActionHeaderCell('Risk'),
-                        createActionHeaderCell('Owner / Status'),
+                        createActionHeaderCell('Inspector Notes'),
+                        createActionHeaderCell('Risk Rating'),
                         createActionHeaderCell('Photo'),
                       ],
                     }),
                     ...findingsWithImages.map((finding) => {
                       const riskFill = getRiskFill(finding.riskBand);
                       const riskTextColor = getRiskTextColor(finding.riskBand);
-
                       const findingTextLines = Array.from(new Set(
-                        (finding.itemComment?.trim() && finding.rowKind === 'finding'
-                          ? [finding.title, finding.observation, `Inspector Note: ${finding.itemComment}`]
-                          : [finding.title, finding.observation])
+                        [
+                          finding.title,
+                          finding.observation !== finding.title ? finding.observation : '',
+                          finding.actionReference,
+                        ]
                           .map((line) => safeText(line).trim())
                           .filter((line) => line.length > 0)
                       ));
 
-                      const ownerStatusLines = [
-                        `Resp: ${safeText(finding.responsiblePerson) || 'N/A'}`,
-                        `Target: ${safeText(finding.targetDate) || 'N/A'}`,
-                        `Status: ${safeText(finding.status) || 'N/A'}`,
-                      ];
-
-                      const riskLines = [
-                        `${finding.riskScore} (${safeText(finding.riskBand)})`,
-                        `L ${finding.likelihood} x S ${finding.severity}`,
-                        safeText(finding.priority) || 'Low',
-                      ];
-
-                      const photoCell = createImageGalleryCell([
+                      const photoCell = createImageGalleryCell(
+                        finding.resolvedPhotos.length > 0
+                          ? finding.resolvedPhotos
+                          : [{ imageData: null, imageType: 'png' as DocxImageType, imageWidth: 800, imageHeight: 600 }],
                         {
-                          imageData: finding.imageData,
-                          imageType: finding.imageType,
-                          imageWidth: finding.imageWidth,
-                          imageHeight: finding.imageHeight,
-                        },
-                      ], {
-                        emptyText: finding.hasPhotoRef ? 'Image unavailable' : 'No image',
-                        maxWidth: 160,
-                        maxHeight: 110,
-                      });
+                          emptyText: finding.hasPhotoRef ? 'Image unavailable' : 'No image',
+                          maxWidth: 150,
+                          maxHeight: 100,
+                        });
 
                       return new TableRow({
                         children: [
                           createBodyCell(finding.refCode, { align: AlignmentType.CENTER, bold: true }),
                           createBodyCell(finding.sectionTitle, { bold: true }),
                           createBodyCellParagraphs(findingTextLines),
-                          createBodyCell(finding.recommendedAction),
-                          createBodyCellParagraphs(riskLines, {
+                          createBodyCell(finding.inspectorNotes || 'N/A'),
+                          createBodyCell(`${safeText(finding.riskBand)} (${finding.riskScore})`, {
                             align: AlignmentType.CENTER,
                             bold: true,
                             fill: riskFill,
                             color: riskTextColor,
                           }),
-                          createBodyCellParagraphs(ownerStatusLines),
                           photoCell,
                         ],
                       });
@@ -1214,67 +1181,55 @@ export async function generateAuditReport(audit: Audit) {
 
           createSectionHeading('10. Action Plan'),
 
-          new Table({
-            width: { size: 100, type: WidthType.PERCENTAGE },
-            layout: TableLayoutType.FIXED,
-            columnWidths: [700, 1900, 2300, 1000, 450, 450, 950, 1150, 950, 950],
-            borders: defaultTableBorders(),
-            rows: [
-              new TableRow({
-                children: [
-                  createActionHeaderCell("Ref"),
-                  createActionHeaderCell("Finding"),
-                  createActionHeaderCell("Action Required"),
-                  createActionHeaderCell("Priority"),
-                  createActionHeaderCell("L"),
-                  createActionHeaderCell("S"),
-                  createActionHeaderCell("Score"),
-                  createActionHeaderCell("Responsible"),
-                  createActionHeaderCell("Target Date"),
-                  createActionHeaderCell("Status"),
-                ],
-              }),
-              ...uniqueActions.map((action, idx) => {
-                const riskBand = safeText(action.riskBand || action.finalRiskRating);
-                const riskFill = getRiskFill(riskBand);
-                const riskTextColor = getRiskTextColor(riskBand);
-                const priorityFill = getRiskFill(action.priority);
-                const priorityTextColor = getRiskTextColor(action.priority);
-
-                const findingFRef = findingRefMap.get(action.findingId);
-                const actionRef = findingFRef != null ? `F${findingFRef}` : `A${idx + 1}`;
-
-                return new TableRow({
-                  children: [
-                    createBodyCell(actionRef, { align: AlignmentType.CENTER, bold: true }),
-                    createBodyCell(action.findingTitle),
-                    createBodyCell(action.actionRequired),
-                    createBodyCell(action.priority, {
-                      align: AlignmentType.CENTER,
-                      bold: true,
-                      fill: priorityFill,
-                      color: priorityTextColor,
+          ...(actionRows.length > 0
+            ? [
+                new Table({
+                  width: { size: 100, type: WidthType.PERCENTAGE },
+                  layout: TableLayoutType.FIXED,
+                  columnWidths: [700, 4200, 1050, 1350, 1050, 1050],
+                  borders: defaultTableBorders(),
+                  rows: [
+                    new TableRow({
+                      children: [
+                        createActionHeaderCell('Ref'),
+                        createActionHeaderCell('Action Required'),
+                        createActionHeaderCell('Priority'),
+                        createActionHeaderCell('Responsible Person'),
+                        createActionHeaderCell('Target Date'),
+                        createActionHeaderCell('Status'),
+                      ],
                     }),
-                    createBodyCell(action.likelihood.toString(), { align: AlignmentType.CENTER }),
-                    createBodyCell(action.severity.toString(), { align: AlignmentType.CENTER }),
-                    createBodyCell(`${action.riskScore} (${riskBand})`, {
-                      align: AlignmentType.CENTER,
-                      bold: true,
-                      fill: riskFill,
-                      color: riskTextColor,
+                    ...actionRows.map((action) => {
+                      const priorityFill = getRiskFill(action.priority);
+                      const priorityTextColor = getRiskTextColor(action.priority);
+                      const statusFill = getStatusFill(action.status);
+                      const statusTextColor = getStatusTextColor(action.status);
+
+                      return new TableRow({
+                        children: [
+                          createBodyCell(action.refCode, { align: AlignmentType.CENTER, bold: true }),
+                          createBodyCell(action.actionRequired),
+                          createBodyCell(action.priority, {
+                            align: AlignmentType.CENTER,
+                            bold: true,
+                            fill: priorityFill,
+                            color: priorityTextColor,
+                          }),
+                          createBodyCell(action.responsiblePerson || 'N/A', { align: AlignmentType.CENTER }),
+                          createBodyCell(action.targetDate ? formatDate(action.targetDate) : 'N/A', { align: AlignmentType.CENTER }),
+                          createBodyCell(action.status, {
+                            align: AlignmentType.CENTER,
+                            bold: true,
+                            fill: statusFill,
+                            color: statusTextColor,
+                          }),
+                        ],
+                      });
                     }),
-                    createBodyCell(action.responsiblePerson),
-                    createBodyCell(action.targetDate, { align: AlignmentType.CENTER }),
-                    createBodyCell(action.status, { align: AlignmentType.CENTER }),
                   ],
-                });
-              }),
-            ],
-          }),
-
-          ...(uniqueActions.length === 0
-            ? [new Paragraph({ text: 'No actions are currently required.', spacing: { before: 120, after: 140 } })]
-            : []),
+                }),
+              ]
+            : [new Paragraph({ text: 'No actions are currently required.', spacing: { before: 120, after: 140 } })]),
 
           createSectionHeading('11. Conclusion / Final Comments'),
 
