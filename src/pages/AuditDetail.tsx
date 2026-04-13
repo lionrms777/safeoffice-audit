@@ -14,6 +14,7 @@ import { formatDate, cn } from '../lib/utils';
 import { generateAuditReport } from '../lib/reportGenerator';
 import { calculateGeneralComplianceMetrics } from '../lib/compliance';
 import { FindingsRegisterTable, ActionPlanTable } from '../components/ReportTables';
+import { resolvePhotoDownloadUrl } from '../lib/firebaseStorage';
 
 function NarrativeBlock({ icon, title, content, defaultContent }: { icon: React.ReactNode; title: string; content: string; defaultContent: string }) {
   const text = (content || defaultContent).trim();
@@ -36,6 +37,8 @@ export default function AuditDetail() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [confirmState, setConfirmState] = useState<{ isOpen: boolean; action: 'delete' | 'reset' }>({ isOpen: false, action: 'delete' });
   const [isActionBusy, setIsActionBusy] = useState(false);
+  const [siteLogoSrc, setSiteLogoSrc] = useState<string>('');
+  const [siteBuildingSrc, setSiteBuildingSrc] = useState<string>('');
 
   useEffect(() => {
     if (id) {
@@ -44,6 +47,31 @@ export default function AuditDetail() {
       else navigate('/');
     }
   }, [id, getAudit, navigate]);
+
+  useEffect(() => {
+    if (!audit) return;
+    let cancelled = false;
+
+    const resolveImages = async () => {
+      const [logo, building] = await Promise.all([
+        audit.siteLogoUrl || audit.siteLogoDataUrl
+          ? Promise.resolve(audit.siteLogoUrl || audit.siteLogoDataUrl || '')
+          : resolvePhotoDownloadUrl(audit.siteLogoPath),
+        audit.siteBuildingPhotoUrl || audit.siteBuildingPhotoDataUrl
+          ? Promise.resolve(audit.siteBuildingPhotoUrl || audit.siteBuildingPhotoDataUrl || '')
+          : resolvePhotoDownloadUrl(audit.siteBuildingPhotoPath),
+      ]);
+
+      if (cancelled) return;
+      setSiteLogoSrc(logo || '');
+      setSiteBuildingSrc(building || '');
+    };
+
+    void resolveImages();
+    return () => {
+      cancelled = true;
+    };
+  }, [audit]);
 
   if (!audit) return null;
 
@@ -141,23 +169,23 @@ export default function AuditDetail() {
               </div>
             </div>
           </div>
-          {(audit.siteLogoUrl || audit.siteBuildingPhotoUrl) && (
+          {(siteLogoSrc || siteBuildingSrc) && (
             <div className="mt-4 flex gap-3 flex-wrap">
-              {audit.siteLogoUrl && (
+              {siteLogoSrc && (
                 <div className="space-y-1">
-                  <img src={audit.siteLogoUrl} alt="Client logo" className="h-16 rounded-lg object-contain border border-slate-100" />
+                  <img src={siteLogoSrc} alt="Client logo" className="h-16 rounded-lg object-contain border border-slate-100" loading="lazy" decoding="async" />
                   <div className="flex gap-2 text-[11px]">
-                    <a href={audit.siteLogoUrl} target="_blank" rel="noopener noreferrer" className="text-slate-600 hover:text-slate-900">View</a>
-                    <a href={audit.siteLogoUrl} target="_blank" rel="noopener noreferrer" download className="text-slate-600 hover:text-slate-900">Download</a>
+                    <a href={siteLogoSrc} target="_blank" rel="noopener noreferrer" className="text-slate-600 hover:text-slate-900">View</a>
+                    <a href={siteLogoSrc} target="_blank" rel="noopener noreferrer" download className="text-slate-600 hover:text-slate-900">Download</a>
                   </div>
                 </div>
               )}
-              {audit.siteBuildingPhotoUrl && (
+              {siteBuildingSrc && (
                 <div className="space-y-1">
-                  <img src={audit.siteBuildingPhotoUrl} alt="Site photo" className="h-32 rounded-lg object-cover border border-slate-100" />
+                  <img src={siteBuildingSrc} alt="Site photo" className="h-32 rounded-lg object-cover border border-slate-100" loading="lazy" decoding="async" />
                   <div className="flex gap-2 text-[11px]">
-                    <a href={audit.siteBuildingPhotoUrl} target="_blank" rel="noopener noreferrer" className="text-slate-600 hover:text-slate-900">View</a>
-                    <a href={audit.siteBuildingPhotoUrl} target="_blank" rel="noopener noreferrer" download className="text-slate-600 hover:text-slate-900">Download</a>
+                    <a href={siteBuildingSrc} target="_blank" rel="noopener noreferrer" className="text-slate-600 hover:text-slate-900">View</a>
+                    <a href={siteBuildingSrc} target="_blank" rel="noopener noreferrer" download className="text-slate-600 hover:text-slate-900">Download</a>
                   </div>
                 </div>
               )}

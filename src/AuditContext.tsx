@@ -1,9 +1,9 @@
 import { createContext, useContext, useEffect, useState, ReactNode, useCallback, useMemo } from 'react';
 import localforage from 'localforage';
 import { Audit, AuditStats } from './types';
-import { saveAuditToFirebase, getUserAuditsFromFirebase, deleteAuditFromFirebase } from './lib/firebaseDb';
+import { saveAuditToFirebase, deleteAuditFromFirebase, subscribeToUserAudits } from './lib/firebaseDb';
 import { useAuth } from './contexts/AuthContext';
-import { deletePhotosSafely, getAllAuditAttachmentUrls, getChecklistPhotoUrls } from './lib/firebaseStorage';
+import { deletePhotosSafely, getAllAuditAttachmentUrls, getChecklistPhotoUrls, resolvePhotoDownloadUrl } from './lib/firebaseStorage';
 
 interface AuditContextType {
   audits: Audit[];
@@ -23,51 +23,208 @@ export function AuditProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const cacheKey = user ? `audits:${user.uid}` : 'audits:guest';
 
+  const hydrateMissingPhotoUrls = useCallback(async (sourceAudits: Audit[]) => {
+    const resolvedUrlCache = new Map<string, string>();
+    let changedAny = false;
+
+    const resolvePath = async (path?: string): Promise<string | undefined> => {
+      const key = (path || '').trim();
+      if (!key) return undefined;
+      const cached = resolvedUrlCache.get(key);
+      if (cached) return cached;
+      const resolved = await resolvePhotoDownloadUrl(key);
+      if (resolved) resolvedUrlCache.set(key, resolved);
+      return resolved || undefined;
+    };
+
+    const hydratedAudits = await Promise.all(sourceAudits.map(async (audit) => {
+      let changed = false;
+      let nextAudit: Audit = audit;
+
+      if (!audit.siteLogoUrl && audit.siteLogoPath) {
+        const url = await resolvePath(audit.siteLogoPath);
+        if (url) {
+          nextAudit = { ...nextAudit, siteLogoUrl: url };
+          changed = true;
+        }
+      }
+
+      if (!nextAudit.siteBuildingPhotoUrl && nextAudit.siteBuildingPhotoPath) {
+        const url = await resolvePath(nextAudit.siteBuildingPhotoPath);
+        if (url) {
+          nextAudit = { ...nextAudit, siteBuildingPhotoUrl: url };
+          changed = true;
+        }
+      }
+
+      const nextSections = await Promise.all(nextAudit.sections.map(async (section) => {
+        let sectionChanged = false;
+
+        const nextItems = await Promise.all(section.items.map(async (item) => {
+          let itemChanged = false;
+          let nextItem = item;
+
+          if (!nextItem.photoUrl && nextItem.photoPath) {
+            const url = await resolvePath(nextItem.photoPath);
+            if (url) {
+              nextItem = { ...nextItem, photoUrl: url };
+              itemChanged = true;
+            }
+          }
+
+          if (nextItem.photos && nextItem.photos.length > 0) {
+            const nextPhotos = await Promise.all(nextItem.photos.map(async (photo) => {
+              if (photo.url || !photo.path) return photo;
+              const url = await resolvePath(photo.path);
+              if (!url) return photo;
+              itemChanged = true;
+              return { ...photo, url };
+            }));
+
+            if (itemChanged) {
+              nextItem = { ...nextItem, photos: nextPhotos };
+            }
+          }
+
+          if (itemChanged) {
+            sectionChanged = true;
+            return nextItem;
+          }
+
+          return item;
+        }));
+
+        if (!sectionChanged) return section;
+        changed = true;
+        return { ...section, items: nextItems };
+      }));
+
+      if (!changed) return audit;
+      changedAny = true;
+      return { ...nextAudit, sections: nextSections, updatedAt: nextAudit.updatedAt || new Date().toISOString() };
+    }));
+
+    if (!changedAny) return;
+
+    setAudits(hydratedAudits);
+    await localforage.setItem(cacheKey, hydratedAudits);
+
+    if (user) {
+      await Promise.all(
+        hydratedAudits.map(async (audit) => {
+          try {
+            await saveAuditToFirebase({ ...audit, userId: audit.userId || user.uid });
+          } catch (error) {
+            console.warn('⚠️ Failed to backfill resolved photo URLs to Firebase:', audit.id, error);
+          }
+        })
+      );
+    }
+  }, [cacheKey, user]);
+
   useEffect(() => {
-    const loadAudits = async () => {
+    let mounted = true;
+    let unsub: (() => void) | null = null;
+
+    const loadAndSubscribe = async () => {
       setLoading(true);
       try {
-        // 1. Try to load from Firebase if user is logged in
-        if (user) {
-          console.log('🔄 Fetching audits from Firebase for:', user.email);
-          const firebaseAudits = await getUserAuditsFromFirebase(user.uid);
-          setAudits(firebaseAudits);
-          // Sync to local storage
-          await localforage.setItem(cacheKey, firebaseAudits);
-        } else {
-          // 2. Fallback to local storage
-          const savedAudits = await localforage.getItem<Audit[]>(cacheKey);
-          if (savedAudits) {
-            setAudits(savedAudits);
-          } else {
+        const cachedAudits = (await localforage.getItem<Audit[]>(cacheKey)) || [];
+        if (mounted && cachedAudits.length > 0) {
+          setAudits(cachedAudits);
+          void hydrateMissingPhotoUrls(cachedAudits);
+        }
+
+        if (!user) {
+          if (mounted && cachedAudits.length === 0) {
             setAudits([]);
           }
+          if (mounted) setLoading(false);
+          return;
         }
+
+        // Real-time cross-device sync source of truth.
+        unsub = subscribeToUserAudits(
+          user.uid,
+          async (liveAudits, meta) => {
+            const normalizedLiveAudits = liveAudits.map((audit) => ({ ...audit, userId: audit.userId || user.uid }));
+
+            const shouldKeepCachedWhileResolving =
+              meta.fromCache &&
+              normalizedLiveAudits.length === 0 &&
+              cachedAudits.length > 0;
+
+            if (shouldKeepCachedWhileResolving) {
+              // Avoid a false empty-state flash on refresh while Firestore resolves from server.
+              if (mounted) setLoading(false);
+              return;
+            }
+
+            if (mounted) {
+              setAudits(normalizedLiveAudits);
+            }
+
+            await localforage.setItem(cacheKey, normalizedLiveAudits);
+            void hydrateMissingPhotoUrls(normalizedLiveAudits);
+
+            // One-time safety migration: if cloud is empty but local cache has audits, backfill userId-tagged docs.
+            if (normalizedLiveAudits.length === 0 && cachedAudits.length > 0) {
+              await Promise.all(
+                cachedAudits.map(async (audit) => {
+                  try {
+                    await saveAuditToFirebase({ ...audit, userId: audit.userId || user.uid });
+                  } catch (error) {
+                    console.warn('⚠️ Failed to backfill cached audit to Firebase:', audit.id, error);
+                  }
+                })
+              );
+            }
+
+            if (mounted && !meta.fromCache) {
+              setLoading(false);
+            }
+            if (mounted && meta.fromCache) {
+              // Cached snapshot still means data is ready to render while network catches up.
+              setLoading(false);
+            }
+          },
+          async (error) => {
+            console.error('❌ Falling back to cached audits after subscription error:', error);
+            const fallback = (await localforage.getItem<Audit[]>(cacheKey)) || [];
+            if (mounted) {
+              setAudits(fallback);
+              setLoading(false);
+            }
+          },
+        );
       } catch (error) {
         console.error('❌ Error loading audits:', error);
-        // Fallback to local storage on error
-        const savedAudits = await localforage.getItem<Audit[]>(cacheKey);
-        if (savedAudits) {
-          setAudits(savedAudits);
-        } else {
-          setAudits([]);
+        const fallback = (await localforage.getItem<Audit[]>(cacheKey)) || [];
+        if (mounted) {
+          setAudits(fallback);
+          setLoading(false);
         }
-      } finally {
-        setLoading(false);
       }
     };
-    loadAudits();
-  }, [user, cacheKey]);
+
+    void loadAndSubscribe();
+
+    return () => {
+      mounted = false;
+      if (unsub) unsub();
+    };
+  }, [user, cacheKey, hydrateMissingPhotoUrls]);
 
   const saveAudit = useCallback(async (audit: Audit) => {
+    const normalizedAudit = user ? { ...audit, userId: audit.userId || user.uid } : audit;
     let nextAudits: Audit[] = [];
 
     setAudits((prevAudits) => {
-      const index = prevAudits.findIndex((a) => a.id === audit.id);
+      const index = prevAudits.findIndex((a) => a.id === normalizedAudit.id);
       if (index >= 0) {
-        nextAudits = prevAudits.map((existing, i) => (i === index ? audit : existing));
+        nextAudits = prevAudits.map((existing, i) => (i === index ? normalizedAudit : existing));
       } else {
-        nextAudits = [...prevAudits, audit];
+        nextAudits = [...prevAudits, normalizedAudit];
       }
       return nextAudits;
     });
@@ -78,7 +235,7 @@ export function AuditProvider({ children }: { children: ReactNode }) {
     // Save to Firebase if logged in
     if (user) {
       try {
-        await saveAuditToFirebase(audit);
+        await saveAuditToFirebase(normalizedAudit);
       } catch (error) {
         console.error('⚠️ Failed to sync with Firebase, saved locally:', error);
       }

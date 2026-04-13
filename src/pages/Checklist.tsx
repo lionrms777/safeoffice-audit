@@ -6,7 +6,7 @@ import { Audit, ComplianceStatus, Finding, Action, ChecklistItem, ItemPhoto } fr
 import { X, MessageSquare, ChevronDown, ChevronUp, Save, Loader2, AlertTriangle, ChevronRight, ChevronLeft, Download, WifiOff, RefreshCw, ImagePlus, ZoomIn } from 'lucide-react';
 import { cn, compressImageUnderSize, withTimeout } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
-import { uploadAuditPhotoWithMeta } from '../lib/firebaseStorage';
+import { uploadAuditPhotoWithMeta, resolvePhotoDownloadUrl } from '../lib/firebaseStorage';
 import {
   addPendingUpload,
   dataUrlToFile,
@@ -48,6 +48,7 @@ export default function Checklist() {
   const [uploadErrors, setUploadErrors] = useState<Record<string, string>>({});
   // localPreviews is keyed by photoId (not itemId) so multiple photos per item each have their own slot
   const [localPreviews, setLocalPreviews] = useState<Record<string, string>>({});
+  const [resolvedPhotoUrls, setResolvedPhotoUrls] = useState<Record<string, string>>({});
   const [lightboxState, setLightboxState] = useState<{ itemId: string; photos: ItemPhoto[]; photoIndex: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const syncPendingUploadsRef = useRef<(() => void) | null>(null);
@@ -119,6 +120,46 @@ export default function Checklist() {
     });
     setLocalPreviews(previews);
   }, [audit?.id]);
+
+  useEffect(() => {
+    if (!audit) return;
+    let cancelled = false;
+
+    const resolveMissingPaths = async () => {
+      const pending: Array<{ photoId: string; path: string }> = [];
+      audit.sections.forEach((section) => {
+        section.items.forEach((item) => {
+          item.photos?.forEach((photo) => {
+            if (!photo.url && photo.path && !resolvedPhotoUrls[photo.id]) {
+              pending.push({ photoId: photo.id, path: photo.path });
+            }
+          });
+        });
+      });
+
+      if (pending.length === 0) return;
+
+      const resolvedEntries = await Promise.all(
+        pending.map(async ({ photoId, path }) => ({ photoId, url: await resolvePhotoDownloadUrl(path) }))
+      );
+
+      if (cancelled) return;
+
+      const next: Record<string, string> = {};
+      resolvedEntries.forEach(({ photoId, url }) => {
+        if (url) next[photoId] = url;
+      });
+
+      if (Object.keys(next).length > 0) {
+        setResolvedPhotoUrls((prev) => ({ ...prev, ...next }));
+      }
+    };
+
+    void resolveMissingPaths();
+    return () => {
+      cancelled = true;
+    };
+  }, [audit, resolvedPhotoUrls]);
 
   useEffect(() => {
     return () => {
@@ -818,7 +859,7 @@ export default function Checklist() {
                                 <div className="flex items-center gap-2 flex-wrap">
                                   {/* Thumbnail strip */}
                                   {allPhotos.map((photo, photoIdx) => {
-                                    const src = photo.url || localPreviews[photo.id] || photo.dataUrl || '';
+                                    const src = photo.url || resolvedPhotoUrls[photo.id] || localPreviews[photo.id] || photo.dataUrl || '';
                                     const isUploading = photo.id === uploadingPhotoId;
                                     const isPending = photo.pending && !photo.url;
                                     const hasError = Boolean(uploadErrors[photo.id]);
@@ -833,6 +874,8 @@ export default function Checklist() {
                                             alt={`Evidence ${photoIdx + 1}`}
                                             className="w-full h-full object-cover"
                                             referrerPolicy="no-referrer"
+                                            loading="lazy"
+                                            decoding="async"
                                           />
                                         ) : (
                                           <div className="text-[9px] text-slate-400 text-center px-1">No preview</div>
@@ -989,7 +1032,9 @@ export default function Checklist() {
         {lightboxState && (() => {
           const { photos: lbPhotos, photoIndex } = lightboxState;
           const photo = lbPhotos[photoIndex];
-          const src = photo?.url || localPreviews[photo?.id] || photo?.dataUrl || '';
+          const resolvedLightboxUrl = photo?.id ? resolvedPhotoUrls[photo.id] : '';
+          const localLightboxPreview = photo?.id ? localPreviews[photo.id] : '';
+          const src = photo?.url || resolvedLightboxUrl || localLightboxPreview || photo?.dataUrl || '';
           const hasPrev = photoIndex > 0;
           const hasNext = photoIndex < lbPhotos.length - 1;
           return (

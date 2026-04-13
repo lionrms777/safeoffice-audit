@@ -1,6 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
+import { getFirestore, enableMultiTabIndexedDbPersistence } from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
 import firebaseConfig from '../../firebase-applet-config.json';
 
@@ -25,5 +25,19 @@ enableIndexedDbPersistence(db).catch((err) => {
 export const auth = getAuth(app);
 export const db = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
 export const storage = getStorage(app);
+
+// Enable offline persistence so writes queue locally and sync when back online.
+enableMultiTabIndexedDbPersistence(db).catch((error) => {
+	const code = typeof error === 'object' && error && 'code' in error
+		? String((error as { code?: string }).code || '')
+		: '';
+	if (code === 'failed-precondition') {
+		console.warn('⚠️ Firestore offline persistence not enabled: multiple tabs without shared persistence support.');
+	} else if (code === 'unimplemented') {
+		console.warn('⚠️ Firestore offline persistence is not available in this browser.');
+	} else {
+		console.warn('⚠️ Firestore offline persistence setup failed:', error);
+	}
+});
 
 export default app;

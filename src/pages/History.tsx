@@ -30,7 +30,7 @@ const initialConfirmState: ConfirmState = {
 };
 
 export default function History() {
-  const { audits, deleteAudit, resetDraftAudit } = useAudits();
+  const { audits, loading, deleteAudit, resetDraftAudit } = useAudits();
   const navigate = useNavigate();
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<'all' | 'completed' | 'draft'>('all');
@@ -126,6 +126,9 @@ export default function History() {
 
   return (
     <Layout title="Audit History" showBack>
+      {loading ? (
+        <div className="card p-8 text-center text-slate-500">Loading audit history...</div>
+      ) : (
       <div className="space-y-6">
         <div className="flex flex-col gap-4">
           <div className="relative">
@@ -332,6 +335,7 @@ export default function History() {
           )}
         </div>
       </div>
+      )}
 
       <ConfirmDialog
         isOpen={confirm.isOpen}

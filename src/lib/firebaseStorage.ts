@@ -138,14 +138,22 @@ export const uploadAuditPhoto = async (auditId: string, file: File): Promise<str
 };
 
 const isLikelyDownloadUrl = (value: string) => /^https?:\/\//i.test(value);
+const resolvedDownloadUrlCache = new Map<string, string>();
 
 export const resolvePhotoDownloadUrl = async (photoPathOrUrl?: string): Promise<string | null> => {
   const raw = (photoPathOrUrl || '').trim();
   if (!raw) return null;
   try {
-    if (isLikelyDownloadUrl(raw)) return raw;
+    const cached = resolvedDownloadUrlCache.get(raw);
+    if (cached) return cached;
+    if (isLikelyDownloadUrl(raw)) {
+      resolvedDownloadUrlCache.set(raw, raw);
+      return raw;
+    }
     const photoRef = ref(storage, raw);
-    return await getDownloadURL(photoRef);
+    const resolved = await getDownloadURL(photoRef);
+    resolvedDownloadUrlCache.set(raw, resolved);
+    return resolved;
   } catch (error) {
     console.warn('⚠️ Failed to resolve photo download URL:', raw, error);
     return null;

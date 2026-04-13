@@ -1,6 +1,8 @@
+import { useEffect, useState } from 'react';
 import { Audit, RiskBand } from '../types';
 import { cn, formatDate } from '../lib/utils';
 import { buildReportActionRows, buildReportFindingRows, ItemPhotoPart } from '../lib/reportTables';
+import { resolvePhotoDownloadUrl } from '../lib/firebaseStorage';
 
 function riskBadge(band: RiskBand) {
   const cls: Record<RiskBand, string> = {
@@ -45,7 +47,32 @@ function statusBadge(status: string) {
 }
 
 function PhotosCell({ photos, hasPhotoRef }: { photos: ItemPhotoPart[]; hasPhotoRef: boolean }) {
-  const visible = photos.filter((p) => p.photoUrl || p.photoDataUrl);
+  const [resolvedUrls, setResolvedUrls] = useState<Record<number, string>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    const resolveMissing = async () => {
+      const next: Record<number, string> = {};
+      await Promise.all(
+        photos.map(async (photo, idx) => {
+          if (photo.photoUrl || !photo.photoPath) return;
+          const resolved = await resolvePhotoDownloadUrl(photo.photoPath);
+          if (resolved) next[idx] = resolved;
+        })
+      );
+      if (!cancelled && Object.keys(next).length > 0) {
+        setResolvedUrls((prev) => ({ ...prev, ...next }));
+      }
+    };
+    void resolveMissing();
+    return () => {
+      cancelled = true;
+    };
+  }, [photos]);
+
+  const visible = photos
+    .map((photo, idx) => ({ photo, idx }))
+    .filter(({ photo, idx }) => photo.photoUrl || photo.photoDataUrl || resolvedUrls[idx]);
 
   if (visible.length === 0) {
     return <span className="text-xs text-slate-400">{hasPhotoRef ? 'Image unavailable' : 'No photo'}</span>;
@@ -53,15 +80,17 @@ function PhotosCell({ photos, hasPhotoRef }: { photos: ItemPhotoPart[]; hasPhoto
 
   return (
     <div className="flex flex-wrap gap-2 justify-center">
-      {visible.map((photo, idx) => {
-        const src = photo.photoUrl || photo.photoDataUrl;
+      {visible.map(({ photo, idx }, displayIdx) => {
+        const src = photo.photoUrl || photo.photoDataUrl || resolvedUrls[idx] || '';
         return (
           <a key={idx} href={src} target="_blank" rel="noopener noreferrer" className="shrink-0">
             <img
               src={src}
-              alt={`Evidence ${idx + 1}`}
+              alt={`Evidence ${displayIdx + 1}`}
               className="h-20 w-20 rounded-lg border border-slate-200 object-cover shadow-sm hover:opacity-80 transition-opacity"
               referrerPolicy="no-referrer"
+              loading="lazy"
+              decoding="async"
             />
           </a>
         );
